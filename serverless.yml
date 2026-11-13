@@ -1,0 +1,46 @@
+service: ghl-lead-scoring-service
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: python3.11
+  stage: ${opt:stage, 'prod'}
+  region: ${opt:region, 'us-east-1'}
+  memorySize: 256
+  timeout: 15
+  logRetentionInDays: 30
+  architecture: arm64
+  environment:
+    LOG_LEVEL: ${env:LOG_LEVEL, 'INFO'}
+    GHL_API_KEY: ${env:GHL_API_KEY, ''}
+    GHL_API_BASE_URL: ${env:GHL_API_BASE_URL, 'https://services.leadconnectorhq.com'}
+    GHL_LOCATION_ID: ${env:GHL_LOCATION_ID, ''}
+    GHL_LEAD_SCORE_FIELD_ID: ${env:GHL_LEAD_SCORE_FIELD_ID, 'lead_score'}
+    GHL_PRIORITY_STAGE_ID: ${env:GHL_PRIORITY_STAGE_ID, 'stage_priority_outreach'}
+    GHL_WEBHOOK_SECRET: ${env:GHL_WEBHOOK_SECRET, ''}
+    GHL_DRY_RUN: ${env:GHL_DRY_RUN, 'false'}
+    SCORING_RULE_OVERRIDES: ${env:SCORING_RULE_OVERRIDES, ''}
+
+package:
+  individually: false
+  patterns:
+    - "!**"
+    - "src/**"
+
+functions:
+  scoreLeadWebhook:
+    handler: src.handlers.lambda_function.lambda_handler
+    description: Processes GoHighLevel v2 webhooks to compute lead scores, tags, and pipeline stage transitions.
+    events:
+      - httpApi:
+          path: /webhooks/ghl/lead-score
+          method: post
+
+plugins:
+  - serverless-python-requirements
+
+custom:
+  pythonRequirements:
+    dockerizePip: false
+    slim: true
+    strip: false

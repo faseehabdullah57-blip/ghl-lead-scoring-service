@@ -21,10 +21,16 @@ from src.handlers.lambda_function import (
 from src.models.lead_event import LeadEvent, normalize_custom_fields
 from src.rules.scoring_rules import (
     DEFAULT_SCORING_RULES,
+    InactivityDecayConfig,
     LeadScoringEngine,
     ScoringRule,
 )
-from src.services.ghl_pipeline_manager import GHLAPIError, GHLPipelineManager
+from src.services.ghl_pipeline_manager import (
+    GLOBAL_IDEMPOTENCY_CACHE,
+    GHLAPIError,
+    GHLPipelineManager,
+    IdempotencyCache,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +174,222 @@ class TestScoringRulesEngine(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 2. Threshold Crossings & GHL Pipeline Manager Tests
+# 2. Inactivity Time-Decay Engine & Hot Lead Downgrade Tests
+# ---------------------------------------------------------------------------
+
+
+class TestInactivityTimeDecayEngine(unittest.TestCase):
+    """Test 14-day, 30-day, and capped inactivity time-decay and Hot Lead downgrade."""
+
+    def setUp(self) -> None:
+        self.engine = LeadScoringEngine()
+
+    def test_14_day_and_30_day_inactivity_decay_and_cap(self) -> None:
+        # (a) 14 days inactive -> 2 full 7-day periods -> -10 points
+        event_14d = LeadEvent.from_webhook_payload(
+            {
+                "contactId": "cnt_decay_14",
+                "timestamp": "2026-11-15T12:00:00Z",
+                "lastActivityDate": "2026-11-01T12:00:00Z",  # 14 days
+                "activity": "Clicked SMS Link",  # +10
+            }
+        )
+        res_14d = self.engine.evaluate(event_14d)
+        self.assertEqual(res_14d.inactive_days, 14)
+        self.assertEqual(res_14d.decay_points, -10)
+        self.assertEqual(res_14d.points_delta, 0)  # +10 + (-10) = 0
+        self.assertIn("Inactivity Time-Decay", res_14d.matched_rule_names)
+
+        # (b) 30 days inactive -> 4 full 7-day periods -> -20 points
+        event_30d = LeadEvent.from_webhook_payload(
+            {
+                "contactId": "cnt_decay_30",
+                "timestamp": "2026-11-30T12:00:00Z",
+                "lastActivityDate": "2026-10-31T12:00:00Z",  # 30 days
+            }
+        )
+        res_30d = self.engine.evaluate(event_30d)
+        self.assertEqual(res_30d.inactive_days, 30)
+        self.assertEqual(res_30d.decay_points, -20)
+        self.assertEqual(res_30d.points_delta, -20)
+        decay_match = res_30d.matched_rules[0]
+        self.assertEqual(decay_match.rule_name, "Inactivity Time-Decay")
+        self.assertIn("30 days inactive (4x 7-day periods", decay_match.reason)
+
+        # (c) 63 days inactive -> 9 full 7-day periods -> capped at -30 max decay
+        event_63d = LeadEvent.from_webhook_payload(
+            {
+                "contactId": "cnt_decay_cap",
+                "timestamp": "2026-12-03T12:00:00Z",
+                "lastActivityDate": "2026-10-01T12:00:00Z",  # 63 days
+            }
+        )
+        res_63d = self.engine.evaluate(event_63d)
+        self.assertEqual(res_63d.inactive_days, 63)
+        self.assertEqual(res_63d.decay_points, -30)
+        self.assertIn("[capped at max decay]", res_63d.matched_rules[0].reason)
+
+    def test_hot_lead_downgrade_when_decay_drops_score_below_50(self) -> None:
+        """Contact with score 55 dropping to 35 after 30-day decay loses 'Hot Lead' and gets 'Re-Engagement Needed'."""
+        manager = GHLPipelineManager(dry_run=True)
+        manager.seed_mock_contact(
+            "cnt_stalled_hot",
+            lead_score=55,
+            tags=["Hot Lead"],
+        )
+
+        event = LeadEvent.from_webhook_payload(
+            {
+                "eventId": "evt_decay_downgrade_01",
+                "contactId": "cnt_stalled_hot",
+                "timestamp": "2026-11-30T10:00:00Z",
+                "lastActivityDate": "2026-10-31T10:00:00Z",  # 30 days inactive -> -20 pts
+            }
+        )
+        scoring_result = self.engine.evaluate(event)
+        action_result = manager.process_scoring_result(event, scoring_result)
+
+        self.assertEqual(action_result.previous_score, 55)
+        self.assertEqual(action_result.points_delta, -20)
+        self.assertEqual(action_result.new_score, 35)
+        self.assertEqual(action_result.threshold_status, "RE_ENGAGEMENT_NEEDED")
+        self.assertEqual(action_result.tags_removed, ["Hot Lead"])
+        self.assertEqual(action_result.tags_added, ["Re-Engagement Needed"])
+
+        ops = {
+            f"{op['method']} {op['endpoint']}": op["payload"]
+            for op in action_result.api_operations
+        }
+        self.assertIn("DELETE /contacts/cnt_stalled_hot/tags", ops)
+        self.assertEqual(
+            ops["DELETE /contacts/cnt_stalled_hot/tags"],
+            {"tags": ["Hot Lead"]},
+        )
+        self.assertIn("POST /contacts/cnt_stalled_hot/tags", ops)
+        self.assertEqual(
+            ops["POST /contacts/cnt_stalled_hot/tags"],
+            {"tags": ["Re-Engagement Needed"]},
+        )
+        self.assertIn("Inactivity Time-Decay: -20 pts", action_result.note_body)
+        self.assertIn("Removed tag(s): Hot Lead", action_result.note_body)
+        self.assertIn("Added tag(s): Re-Engagement Needed", action_result.note_body)
+
+
+# ---------------------------------------------------------------------------
+# 3. Webhook Event Deduplication / Idempotency & Speed-to-Lead Task Tests
+# ---------------------------------------------------------------------------
+
+
+class TestIdempotencyAndSpeedToLeadTasks(unittest.TestCase):
+    """Test webhook idempotency deduplication and automatic Speed-to-Lead GHL task creation."""
+
+    def test_duplicate_event_id_rejected_without_double_counting(self) -> None:
+        """Duplicate webhook retries with the same eventId return HTTP 200 status='duplicate_ignored'."""
+        GLOBAL_IDEMPOTENCY_CACHE.clear()
+        api_event = build_mock_api_gateway_event(event_id="evt_idemp_999")
+
+        # First delivery -> processed normally
+        first_res = lambda_handler(api_event, None)
+        self.assertEqual(first_res["statusCode"], 200)
+        first_body = json.loads(first_res["body"])
+        self.assertEqual(first_body["status"], "success")
+        self.assertFalse(first_body["duplicateIgnored"])
+        self.assertEqual(first_body["newScore"], 60)
+
+        # Second delivery (retry with identical eventId) -> duplicate_ignored
+        second_res = lambda_handler(api_event, None)
+        self.assertEqual(second_res["statusCode"], 200)
+        second_body = json.loads(second_res["body"])
+        self.assertEqual(second_body["status"], "duplicate_ignored")
+        self.assertTrue(second_body["duplicateIgnored"])
+        self.assertEqual(second_body["idempotencyKey"], "evt_idemp_999")
+        self.assertEqual(second_body["pointsDelta"], 0)
+        self.assertEqual(second_body["newScore"], 60)
+        self.assertEqual(second_body["apiOperations"], [])
+
+    def test_cold_start_idempotency_via_contact_notes_inspection(self) -> None:
+        """Even with an empty warm cache, duplicate eventId in contact notes prevents double-scoring."""
+        cold_cache = IdempotencyCache(ttl_seconds=3600)
+        manager = GHLPipelineManager(dry_run=True, idempotency_cache=cold_cache)
+        manager.seed_mock_contact(
+            "cnt_cold_1",
+            lead_score=45,
+            notes=[
+                "[2026-11-13T09:00:00Z] Automated Lead Scoring Update\n"
+                "Idempotency Key: evt_already_in_notes_77"
+            ],
+        )
+
+        event = LeadEvent.from_webhook_payload(
+            {
+                "eventId": "evt_already_in_notes_77",
+                "contactId": "cnt_cold_1",
+                "activity": "Booked Appointment",
+            }
+        )
+        scoring_result = LeadScoringEngine().evaluate(event)
+        action_result = manager.process_scoring_result(event, scoring_result)
+
+        self.assertTrue(action_result.duplicate_ignored)
+        self.assertEqual(action_result.threshold_status, "DUPLICATE_IGNORED")
+        self.assertEqual(action_result.points_delta, 0)
+        self.assertEqual(action_result.new_score, 45)
+        # Only GET /contacts/cnt_cold_1 was executed; no PUT or POST calls
+        self.assertEqual(len(action_result.api_operations), 1)
+        self.assertEqual(action_result.api_operations[0]["method"], "GET")
+
+    def test_deterministic_sha256_idempotency_key_fallback(self) -> None:
+        """When eventId/webhookId is absent, compute deterministic SHA-256 from contactId + activity + timestamp."""
+        payload = {
+            "contactId": "cnt_hash_01",
+            "activity": "Form Submitted",
+            "timestamp": "2026-11-13T10:00:00Z",
+        }
+        e1 = LeadEvent.from_webhook_payload(payload)
+        e2 = LeadEvent.from_webhook_payload(payload)
+        self.assertTrue(e1.compute_idempotency_key().startswith("sha256:"))
+        self.assertEqual(e1.compute_idempotency_key(), e2.compute_idempotency_key())
+
+    def test_speed_to_lead_task_creation_when_crossing_50(self) -> None:
+        """Crossing >= 50 creates an urgent GHL task due 15 minutes from event timestamp."""
+        manager = GHLPipelineManager(dry_run=True)
+        manager.seed_mock_contact("cnt_speed", lead_score=35, opportunity_id="opp_speed_1")
+
+        event = LeadEvent.from_webhook_payload(
+            {
+                "eventId": "evt_speed_01",
+                "contactId": "cnt_speed",
+                "opportunityId": "opp_speed_1",
+                "assignedTo": "usr_closer_42",
+                "timestamp": "2026-11-13T14:30:00Z",
+                "activities": ["Booked Appointment", "Clicked SMS Link"],  # +20 + +10 = +30 -> 65
+            }
+        )
+        scoring_result = LeadScoringEngine().evaluate(event)
+        action_result = manager.process_scoring_result(event, scoring_result)
+
+        self.assertEqual(action_result.new_score, 65)
+        self.assertIsNotNone(action_result.task_created)
+        task = action_result.task_created or {}
+        self.assertEqual(task["title"], "URGENT: Call Hot Lead (Score: 65)")
+        self.assertEqual(task["dueDate"], "2026-11-13T14:45:00Z")
+        self.assertEqual(task["assignedTo"], "usr_closer_42")
+        self.assertIn("Booked Appointment (+20 pts)", task["body"])
+        self.assertIn("Clicked SMS Link (+10 pts)", task["body"])
+
+        ops = {
+            f"{op['method']} {op['endpoint']}": op["payload"]
+            for op in action_result.api_operations
+        }
+        self.assertIn("POST /contacts/cnt_speed/tasks", ops)
+        self.assertEqual(
+            ops["POST /contacts/cnt_speed/tasks"]["title"],
+            "URGENT: Call Hot Lead (Score: 65)",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4. Threshold Crossings & GHL Pipeline Manager Tests
 # ---------------------------------------------------------------------------
 
 
@@ -176,7 +397,7 @@ class TestGHLPipelineThresholdsAndPayloads(unittest.TestCase):
     """Test threshold crossings (>= 50 and < 0), GHL API v2 payloads, and retries."""
 
     def test_hot_lead_threshold_crossing_at_50(self) -> None:
-        """Score crossing >= 50 adds 'Hot Lead' tag and moves opportunity to 'Priority Outreach'."""
+        """Score crossing >= 50 adds 'Hot Lead' tag, moves stage, and creates follow-up task."""
         manager = GHLPipelineManager(dry_run=True, priority_stage_id="stage_prio_99")
         manager.seed_mock_contact("cnt_hot", lead_score=30, opportunity_id="opp_hot_1")
 
@@ -184,6 +405,7 @@ class TestGHLPipelineThresholdsAndPayloads(unittest.TestCase):
             {
                 "contactId": "cnt_hot",
                 "opportunityId": "opp_hot_1",
+                "timestamp": "2026-11-13T10:00:00Z",
                 "activity": "Booked Appointment",  # +20 -> exact 50
             }
         )
@@ -196,6 +418,7 @@ class TestGHLPipelineThresholdsAndPayloads(unittest.TestCase):
         self.assertEqual(action_result.threshold_status, "HOT_LEAD")
         self.assertEqual(action_result.tags_added, ["Hot Lead"])
         self.assertEqual(action_result.opportunity_stage_moved, "Priority Outreach")
+        self.assertIsNotNone(action_result.task_created)
 
         # Verify GHL API v2 calls and payload formatting
         ops = {
@@ -228,6 +451,7 @@ class TestGHLPipelineThresholdsAndPayloads(unittest.TestCase):
             },
         )
 
+        self.assertIn("POST /contacts/cnt_hot/tasks", ops)
         self.assertIn("POST /contacts/cnt_hot/notes", ops)
         note_body = ops["POST /contacts/cnt_hot/notes"]["body"]
         self.assertIn("Previous Score: 30 | Change: +20 | New Total: 50", note_body)
@@ -317,6 +541,7 @@ class TestGHLPipelineThresholdsAndPayloads(unittest.TestCase):
             generic_ok_resp,    # PUT /contacts/cnt_live
             generic_ok_resp,    # POST /contacts/cnt_live/tags
             generic_ok_resp,    # PUT /opportunities/opp_live_1
+            generic_ok_resp,    # POST /contacts/cnt_live/tasks (Speed-to-Lead task)
             generic_ok_resp,    # POST /contacts/cnt_live/notes
         ]
 
@@ -340,7 +565,7 @@ class TestGHLPipelineThresholdsAndPayloads(unittest.TestCase):
 
         self.assertFalse(action_result.dry_run)
         self.assertEqual(action_result.new_score, 55)
-        self.assertEqual(mock_session.request.call_count, 6)
+        self.assertEqual(mock_session.request.call_count, 7)
 
         first_call_kwargs = mock_session.request.call_args_list[0].kwargs
         self.assertEqual(
@@ -351,7 +576,7 @@ class TestGHLPipelineThresholdsAndPayloads(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 3. End-to-End AWS Lambda Handler Tests
+# 5. End-to-End AWS Lambda Handler Tests
 # ---------------------------------------------------------------------------
 
 
@@ -373,9 +598,14 @@ class TestLambdaHandlerEndToEnd(unittest.TestCase):
         self.assertEqual(body["thresholdStatus"], "HOT_LEAD")
         self.assertIn("Hot Lead", body["tagsAdded"])
         self.assertEqual(body["opportunityStageMoved"], "Priority Outreach")
+        self.assertIsNotNone(body["taskCreated"])
+        self.assertEqual(
+            body["taskCreated"]["title"], "URGENT: Call Hot Lead (Score: 60)"
+        )
 
     def test_lambda_handler_base64_encoded_payload(self) -> None:
         raw_payload = {
+            "eventId": "evt_b64_unique",
             "contactId": "cnt_b64",
             "activity": "Unsubscribed",
             "customFields": {"lead_score": 10},

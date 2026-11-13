@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -60,6 +61,10 @@ class LeadEvent:
     email: Optional[str] = None
     phone: Optional[str] = None
     full_name: Optional[str] = None
+    event_id: Optional[str] = None
+    event_timestamp: Optional[str] = None
+    last_activity_date: Optional[str] = None
+    assigned_to: Optional[str] = None
     raw_payload: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -68,7 +73,9 @@ class LeadEvent:
         if not isinstance(payload, dict):
             raise ValueError("Webhook payload must be a JSON object/dictionary.")
 
-        contact_block = payload.get("contact") if isinstance(payload.get("contact"), dict) else {}
+        contact_block = (
+            payload.get("contact") if isinstance(payload.get("contact"), dict) else {}
+        )
 
         contact_id = (
             payload.get("contactId")
@@ -78,7 +85,9 @@ class LeadEvent:
             or payload.get("id")
         )
         if not contact_id or not str(contact_id).strip():
-            raise ValueError("Missing required contact identifier ('contactId' or 'contact_id').")
+            raise ValueError(
+                "Missing required contact identifier ('contactId' or 'contact_id')."
+            )
         contact_id = str(contact_id).strip()
 
         event_type = str(
@@ -103,7 +112,9 @@ class LeadEvent:
                 [act.strip() for act in raw_activities.split(",") if act.strip()]
             )
         elif isinstance(raw_activities, list):
-            activities.extend([str(act).strip() for act in raw_activities if str(act).strip()])
+            activities.extend(
+                [str(act).strip() for act in raw_activities if str(act).strip()]
+            )
 
         single_activity = payload.get("activity") or payload.get("action")
         if isinstance(single_activity, str) and single_activity.strip():
@@ -114,7 +125,9 @@ class LeadEvent:
             activities.append(event_type)
 
         # Normalize tags
-        raw_tags = payload.get("tags") if "tags" in payload else contact_block.get("tags", [])
+        raw_tags = (
+            payload.get("tags") if "tags" in payload else contact_block.get("tags", [])
+        )
         tags: List[str] = []
         if isinstance(raw_tags, str):
             tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
@@ -169,6 +182,51 @@ class LeadEvent:
             or contact_block.get("fullName")
         )
 
+        # Extract idempotency eventId / webhookId
+        raw_event_id = (
+            payload.get("eventId")
+            or payload.get("event_id")
+            or payload.get("webhookId")
+            or payload.get("webhook_id")
+            or payload.get("messageId")
+        )
+        event_id = str(raw_event_id).strip() if raw_event_id else None
+
+        # Extract event timestamp
+        raw_timestamp = (
+            payload.get("timestamp")
+            or payload.get("eventTimestamp")
+            or payload.get("event_timestamp")
+            or payload.get("createdAt")
+            or payload.get("created_at")
+            or payload.get("dateAdded")
+        )
+        event_timestamp = str(raw_timestamp).strip() if raw_timestamp else None
+
+        # Extract lastActivityDate for inactivity time-decay engine
+        raw_last_activity = (
+            payload.get("lastActivityDate")
+            or payload.get("last_activity_date")
+            or contact_block.get("lastActivityDate")
+            or contact_block.get("last_activity_date")
+            or merged_custom_fields.get("lastActivityDate")
+            or merged_custom_fields.get("last_activity_date")
+        )
+        last_activity_date = (
+            str(raw_last_activity).strip() if raw_last_activity else None
+        )
+
+        # Extract assignedTo user ID for Speed-to-Lead task creation
+        raw_assigned_to = (
+            payload.get("assignedTo")
+            or payload.get("assigned_to")
+            or payload.get("userId")
+            or payload.get("user_id")
+            or contact_block.get("assignedTo")
+            or contact_block.get("assigned_to")
+        )
+        assigned_to = str(raw_assigned_to).strip() if raw_assigned_to else None
+
         return cls(
             contact_id=contact_id,
             event_type=event_type,
@@ -181,6 +239,10 @@ class LeadEvent:
             email=str(email) if email else None,
             phone=str(phone) if phone else None,
             full_name=str(full_name) if full_name else None,
+            event_id=event_id,
+            event_timestamp=event_timestamp,
+            last_activity_date=last_activity_date,
+            assigned_to=assigned_to,
             raw_payload=payload,
         )
 
@@ -193,6 +255,18 @@ class LeadEvent:
                 except (ValueError, TypeError):
                     continue
         return None
+
+    def compute_idempotency_key(self) -> str:
+        """Return explicit eventId/webhookId or deterministic SHA-256 hash of contactId + activity + timestamp."""
+        if self.event_id:
+            return self.event_id
+        activity_signature = (
+            "|".join(sorted(self.activities)) if self.activities else self.event_type
+        )
+        timestamp_part = self.event_timestamp or ""
+        composite = f"{self.contact_id}:{activity_signature}:{timestamp_part}"
+        digest = hashlib.sha256(composite.encode("utf-8")).hexdigest()
+        return f"sha256:{digest}"
 
 
 @dataclass(frozen=True)
@@ -223,6 +297,8 @@ class ScoringResult:
     contact_id: str
     points_delta: int
     matched_rules: List[RuleMatch] = field(default_factory=list)
+    decay_points: int = 0
+    inactive_days: int = 0
     evaluated_at: str = field(default_factory=_utc_now_iso)
 
     @property
@@ -245,6 +321,8 @@ class ScoringResult:
         return {
             "contactId": self.contact_id,
             "pointsDelta": self.points_delta,
+            "decayPoints": self.decay_points,
+            "inactiveDays": self.inactive_days,
             "matchedRules": [m.to_dict() for m in self.matched_rules],
             "evaluatedAt": self.evaluated_at,
         }
@@ -260,8 +338,12 @@ class PipelineActionResult:
     new_score: int
     threshold_status: str
     tags_added: List[str] = field(default_factory=list)
+    tags_removed: List[str] = field(default_factory=list)
     opportunity_stage_moved: Optional[str] = None
+    task_created: Optional[Dict[str, Any]] = None
     note_body: str = ""
+    idempotency_key: str = ""
+    duplicate_ignored: bool = False
     dry_run: bool = True
     api_operations: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -274,8 +356,12 @@ class PipelineActionResult:
             "newScore": self.new_score,
             "thresholdStatus": self.threshold_status,
             "tagsAdded": self.tags_added,
+            "tagsRemoved": self.tags_removed,
             "opportunityStageMoved": self.opportunity_stage_moved,
+            "taskCreated": self.task_created,
             "noteBody": self.note_body,
+            "idempotencyKey": self.idempotency_key,
+            "duplicateIgnored": self.duplicate_ignored,
             "dryRun": self.dry_run,
             "apiOperations": self.api_operations,
         }

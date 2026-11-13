@@ -1,9 +1,10 @@
-"""Standalone, configurable Lead Scoring Rules Engine for GoHighLevel events."""
+"""Standalone, configurable Lead Scoring Rules Engine with Inactivity Time-Decay for GoHighLevel."""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from src.models.lead_event import LeadEvent, RuleMatch, ScoringResult
@@ -12,6 +13,24 @@ from src.models.lead_event import LeadEvent, RuleMatch, ScoringResult
 def _normalize_token(value: str) -> str:
     """Normalize a string token for case-insensitive comparison."""
     return re.sub(r"[\s_\-]+", " ", str(value).strip().lower())
+
+
+def parse_iso_datetime(raw_value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp string into a timezone-aware UTC datetime."""
+    if not raw_value or not isinstance(raw_value, str):
+        return None
+    cleaned = raw_value.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith("Z") or cleaned.endswith("z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _parse_numeric_budget(raw_val: Any) -> Optional[float]:
@@ -31,7 +50,6 @@ def _parse_numeric_budget(raw_val: Any) -> Optional[float]:
     if any(prefix in text for prefix in ("<", "under", "below", "less than")):
         return None
 
-    # Handle range like "5000-10000" or "$5k - $10k" by extracting the first or max value
     k_match = re.search(r"(\d+(?:\.\d+)?)\s*k\b", text)
     if k_match:
         val = float(k_match.group(1)) * 1000.0
@@ -109,6 +127,74 @@ def is_budget_over_5k(event: LeadEvent) -> Tuple[bool, str]:
             return True, f"Signal matched: '{signal}'"
 
     return False, ""
+
+
+@dataclass(frozen=True)
+class InactivityDecayConfig:
+    """Configuration for the 7-day Inactivity Time-Decay Engine."""
+
+    enabled: bool = True
+    period_days: int = 7
+    points_per_period: int = -5
+    max_decay_points: int = -30
+    rule_id: str = "inactivity_time_decay"
+    rule_name: str = "Inactivity Time-Decay"
+
+
+def evaluate_inactivity_decay(
+    event: LeadEvent,
+    config: InactivityDecayConfig = InactivityDecayConfig(),
+    reference_time: Optional[datetime] = None,
+) -> Tuple[Optional[RuleMatch], int]:
+    """Calculate 7-day inactivity decay penalty from `lastActivityDate` on the contact payload.
+
+    Returns a tuple of ``(RuleMatch | None, inactive_days)``.
+    Default penalty is -5 points per full 7 days of inactivity, capped at -30 points maximum decay.
+    """
+    if not config.enabled or not event.last_activity_date:
+        return None, 0
+
+    last_activity_dt = parse_iso_datetime(event.last_activity_date)
+    if last_activity_dt is None:
+        return None, 0
+
+    ref_dt = (
+        reference_time
+        or parse_iso_datetime(event.event_timestamp)
+        or datetime.now(timezone.utc)
+    )
+    if ref_dt.tzinfo is None:
+        ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+
+    elapsed_seconds = (ref_dt - last_activity_dt).total_seconds()
+    if elapsed_seconds <= 0:
+        return None, 0
+
+    inactive_days = int(elapsed_seconds // 86400)
+    period_length = max(1, int(config.period_days))
+    full_periods = inactive_days // period_length
+    if full_periods <= 0:
+        return None, inactive_days
+
+    step_penalty = -abs(int(config.points_per_period))
+    cap_penalty = -abs(int(config.max_decay_points))
+    raw_penalty = step_penalty * full_periods
+    applied_penalty = max(raw_penalty, cap_penalty)
+
+    cap_suffix = " [capped at max decay]" if raw_penalty < cap_penalty else ""
+    reason = (
+        f"{inactive_days} days inactive ({full_periods}x {period_length}-day "
+        f"periods since {event.last_activity_date}){cap_suffix}"
+    )
+
+    match = RuleMatch(
+        rule_id=config.rule_id,
+        rule_name=config.rule_name,
+        points=applied_penalty,
+        reason=reason,
+        category="negative",
+    )
+    return match, inactive_days
 
 
 @dataclass(frozen=True)
@@ -262,15 +348,25 @@ RuleOverrideValue = Union[int, Dict[str, Any], ScoringRule]
 
 
 class LeadScoringEngine:
-    """Configurable rules engine for evaluating GoHighLevel lead events."""
+    """Configurable rules engine for evaluating GoHighLevel lead events and inactivity decay."""
 
     def __init__(
         self,
         rules: Optional[Iterable[ScoringRule]] = None,
         rule_overrides: Optional[Dict[str, RuleOverrideValue]] = None,
+        decay_config: Optional[InactivityDecayConfig] = None,
+        decay_points_per_period: int = -5,
+        max_decay_points: int = -30,
+        decay_period_days: int = 7,
     ) -> None:
         base_rules = list(rules) if rules is not None else list(DEFAULT_SCORING_RULES)
         self._rules: List[ScoringRule] = list(base_rules)
+        self.decay_config: InactivityDecayConfig = decay_config or InactivityDecayConfig(
+            enabled=True,
+            period_days=decay_period_days,
+            points_per_period=decay_points_per_period,
+            max_decay_points=max_decay_points,
+        )
         if rule_overrides:
             self.apply_overrides(rule_overrides)
 
@@ -303,6 +399,9 @@ class LeadScoringEngine:
     def disable_rule(self, identifier: str) -> bool:
         """Disable a rule by ID or name. Returns True if found and disabled."""
         norm_id = _normalize_token(identifier)
+        if norm_id in ("inactivity time decay", "inactivity_time_decay"):
+            self.decay_config = replace(self.decay_config, enabled=False)
+            return True
         for idx, existing in enumerate(self._rules):
             if (
                 _normalize_token(existing.rule_id) == norm_id
@@ -318,10 +417,30 @@ class LeadScoringEngine:
         Examples of supported override formats:
         - ``{"Booked Appointment": 30}`` (updates points for an existing rule)
         - ``{"booked_appointment": {"points": 25, "enabled": True}}``
+        - ``{"Inactivity Time-Decay": {"points_per_period": -10, "max_decay_points": -40}}``
         - ``{"Attended Webinar": 12}`` (registers a new activity/tag rule dynamically)
         - ``{"custom_rule": ScoringRule(...)}`` (registers a full ScoringRule instance)
         """
         for key, override in overrides.items():
+            norm_key = _normalize_token(key)
+            if norm_key in ("inactivity time decay", "inactivity_time_decay"):
+                if isinstance(override, int):
+                    self.decay_config = replace(self.decay_config, points_per_period=override)
+                elif isinstance(override, dict):
+                    decay_updates: Dict[str, Any] = {}
+                    if "enabled" in override:
+                        decay_updates["enabled"] = bool(override["enabled"])
+                    if "period_days" in override:
+                        decay_updates["period_days"] = int(override["period_days"])
+                    if "points_per_period" in override or "points" in override:
+                        decay_updates["points_per_period"] = int(
+                            override.get("points_per_period", override.get("points"))
+                        )
+                    if "max_decay_points" in override:
+                        decay_updates["max_decay_points"] = int(override["max_decay_points"])
+                    self.decay_config = replace(self.decay_config, **decay_updates)
+                continue
+
             if isinstance(override, ScoringRule):
                 self.register_rule(override)
                 continue
@@ -354,7 +473,6 @@ class LeadScoringEngine:
                     raise TypeError(f"Unsupported rule override type for '{key}': {type(override)}")
                 self.register_rule(updated)
             else:
-                # Create a new custom rule from key + int/dict specification
                 slug = re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_") or "custom_rule"
                 if isinstance(override, int):
                     new_rule = ScoringRule(
@@ -384,8 +502,12 @@ class LeadScoringEngine:
                     raise TypeError(f"Unsupported rule override type for '{key}': {type(override)}")
                 self.register_rule(new_rule)
 
-    def evaluate(self, event: Union[LeadEvent, Dict[str, Any]]) -> ScoringResult:
-        """Evaluate all enabled rules against a LeadEvent (or raw webhook payload dict)."""
+    def evaluate(
+        self,
+        event: Union[LeadEvent, Dict[str, Any]],
+        reference_time: Optional[datetime] = None,
+    ) -> ScoringResult:
+        """Evaluate all enabled rules and inactivity time-decay against a LeadEvent."""
         lead_event = (
             event
             if isinstance(event, LeadEvent)
@@ -401,8 +523,22 @@ class LeadScoringEngine:
                 matched_rules.append(match)
                 total_delta += match.points
 
+        # Evaluate 7-day Inactivity Time-Decay Engine
+        decay_match, inactive_days = evaluate_inactivity_decay(
+            lead_event,
+            config=self.decay_config,
+            reference_time=reference_time,
+        )
+        decay_points = 0
+        if decay_match is not None:
+            matched_rules.append(decay_match)
+            total_delta += decay_match.points
+            decay_points = decay_match.points
+
         return ScoringResult(
             contact_id=lead_event.contact_id,
             points_delta=total_delta,
             matched_rules=matched_rules,
+            decay_points=decay_points,
+            inactive_days=inactive_days,
         )
